@@ -24,7 +24,6 @@ from tinker_cookbook.eval.evaluators import SamplingClientEvaluator, SamplingCli
 from tinker_cookbook.rl.data_processing import (
     assemble_training_data,
     compute_advantages,
-    remove_constant_reward_groups,
 )
 from tinker_cookbook.rl.metric_util import RLTestSetEvaluator, compute_trajectory_metrics
 from tinker_cookbook.rl.metrics import (
@@ -778,13 +777,85 @@ async def do_group_rollout_and_filter_constant_reward(
     policy = TinkerTokenCompleter(sampling_client, max_tokens=max_tokens, temperature=temperature)
 
     with logtree.optional_enable_logging(enable_logging):
-        trajectory_group = await do_group_rollout(env_group_builder, policy)
+        try:
+            trajectory_group = await do_group_rollout(env_group_builder, policy)
+        except Exception:
+            logger.exception("Group rollout failed; dropping this trajectory group.")
+            return None
 
     # Remove if all trajectories have the same reward
     if do_remove_constant_reward_groups and all_same(trajectory_group.get_total_rewards()):
         return None
     else:
         return trajectory_group
+
+
+def _is_rollout_valid_for_training(trajectory: Any) -> bool:
+    if not getattr(trajectory, "transitions", None):
+        return False
+    final_transition = trajectory.transitions[-1]
+    rollout_valid = final_transition.metrics.get("rollout_valid", 1.0)
+    try:
+        return float(rollout_valid) == 1.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _filter_invalid_rollouts_from_group_pairs(
+    env_group_builders: Sequence[EnvGroupBuilder],
+    trajectory_groups: Sequence[TrajectoryGroup],
+) -> tuple[list[EnvGroupBuilder], list[TrajectoryGroup], dict[str, int]]:
+    filtered_builders: list[EnvGroupBuilder] = []
+    filtered_groups: list[TrajectoryGroup] = []
+    dropped_groups_all_invalid = 0
+    dropped_trajectories_invalid = 0
+
+    for env_group_builder, trajectory_group in safezip(env_group_builders, trajectory_groups):
+        valid_indices = [
+            idx
+            for idx, trajectory in enumerate(trajectory_group.trajectories_G)
+            if _is_rollout_valid_for_training(trajectory)
+        ]
+        dropped_trajectories_invalid += len(trajectory_group.trajectories_G) - len(valid_indices)
+        if not valid_indices:
+            dropped_groups_all_invalid += 1
+            continue
+
+        if len(valid_indices) == len(trajectory_group.trajectories_G):
+            filtered_group = trajectory_group
+        else:
+            filtered_group = TrajectoryGroup(
+                trajectories_G=[trajectory_group.trajectories_G[i] for i in valid_indices],
+                final_rewards_G=[trajectory_group.final_rewards_G[i] for i in valid_indices],
+                metrics_G=[trajectory_group.metrics_G[i] for i in valid_indices],
+            )
+
+        filtered_builders.append(env_group_builder)
+        filtered_groups.append(filtered_group)
+
+    stats = {
+        "groups_dropped_all_invalid": dropped_groups_all_invalid,
+        "trajectories_dropped_invalid": dropped_trajectories_invalid,
+    }
+    return filtered_builders, filtered_groups, stats
+
+
+def _remove_constant_reward_group_pairs(
+    env_group_builders: Sequence[EnvGroupBuilder],
+    trajectory_groups: Sequence[TrajectoryGroup],
+) -> tuple[list[EnvGroupBuilder], list[TrajectoryGroup], int]:
+    filtered_builders: list[EnvGroupBuilder] = []
+    filtered_groups: list[TrajectoryGroup] = []
+    dropped_constant_groups = 0
+
+    for env_group_builder, trajectory_group in safezip(env_group_builders, trajectory_groups):
+        if all_same(trajectory_group.get_total_rewards()):
+            dropped_constant_groups += 1
+            continue
+        filtered_builders.append(env_group_builder)
+        filtered_groups.append(trajectory_group)
+
+    return filtered_builders, filtered_groups, dropped_constant_groups
 
 
 @scope
@@ -1132,8 +1203,49 @@ async def do_sync_training(
                 desc=f"Sampling batch {i_batch}",
             )
 
+        metrics["sampling/groups_requested"] = len(env_group_builders_P)
+        non_none_pairs = [
+            (builder, trajectory_group)
+            for builder, trajectory_group in safezip(env_group_builders_P, trajectory_groups_P)
+            if trajectory_group is not None
+        ]
+        metrics["sampling/groups_rollout_failed"] = len(env_group_builders_P) - len(non_none_pairs)
+
+        if not non_none_pairs:
+            metrics["train/skipped_no_groups_after_rollout"] = 1.0
+            metrics["time/total"] = time.time() - t_start
+            ml_logger.log_metrics(metrics, step=i_batch)
+            continue
+
+        env_group_builders_P = [builder for builder, _ in non_none_pairs]
+        trajectory_groups_P = [trajectory_group for _, trajectory_group in non_none_pairs]
+
+        (
+            env_group_builders_P,
+            trajectory_groups_P,
+            validity_filter_stats,
+        ) = _filter_invalid_rollouts_from_group_pairs(env_group_builders_P, trajectory_groups_P)
+        metrics["sampling/groups_dropped_all_invalid"] = validity_filter_stats[
+            "groups_dropped_all_invalid"
+        ]
+        metrics["sampling/trajectories_dropped_invalid"] = validity_filter_stats[
+            "trajectories_dropped_invalid"
+        ]
+
         if cfg.remove_constant_reward_groups:
-            trajectory_groups_P = remove_constant_reward_groups(trajectory_groups_P)
+            (
+                env_group_builders_P,
+                trajectory_groups_P,
+                dropped_constant_groups,
+            ) = _remove_constant_reward_group_pairs(env_group_builders_P, trajectory_groups_P)
+            metrics["sampling/groups_dropped_constant_reward"] = dropped_constant_groups
+
+        metrics["sampling/groups_used_for_training"] = len(trajectory_groups_P)
+        if len(trajectory_groups_P) == 0:
+            metrics["train/skipped_no_valid_groups"] = 1.0
+            metrics["time/total"] = time.time() - t_start
+            ml_logger.log_metrics(metrics, step=i_batch)
+            continue
 
         # Train step
         sampling_client, train_step_metrics = await do_train_step_and_get_sampling_client(
